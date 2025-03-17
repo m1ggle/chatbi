@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import subprocess
@@ -6,7 +7,9 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import argparse
 
-
+# 添加日志，设置日志级别为error
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.setLevel(logging.ERROR)
 def get_git_changes(repo_path):
     """获取Git仓库中的更改内容"""
     os.chdir(repo_path)
