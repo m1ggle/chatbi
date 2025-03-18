@@ -5,16 +5,15 @@ import subprocess
 import sys
 import time
 
-from langchain.chains.llm import LLMChain
-from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama.llms import OllamaLLM
-from langchain.embeddings import OllamaEmbeddings
-from langchain.llms import Ollama
+from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from pymilvus import connections, Collection, CollectionSchema, FieldSchema, DataType, utility
+from langchain_ollama import OllamaEmbeddings
+from langchain_ollama.llms import OllamaLLM
+from pymilvus import MilvusClient, FieldSchema, DataType, CollectionSchema
 
 
 def get_git_changes(repo_path):
+
     """获取Git仓库中的更改内容"""
     os.chdir(repo_path)
     # 检查是否是git仓库
@@ -51,102 +50,150 @@ def get_current_branch():
         return "main"
 
 
-def setup_milvus_connection(host='localhost', port='19530', collection_name='git_commits'):
-    """设置Milvus连接并创建集合（如果不存在）"""
+def setup_milvus_lite(uri='.milvus.db', collection_name='git_commits'):
+    """设置MilvusLite连接并创建集合（如果不存在）"""
     try:
-        # 连接到Milvus服务
-        connections.connect(alias="default", host=host, port=port)
+        # 连接到MilvusLite
+        client = MilvusClient(uri=uri)
+        model = OllamaLLM(model="qwen2.5:3b")
+        embeddings_model = OllamaEmbeddings(model="qwen2.5:3b")
+        # 检查集合是否存在
+        collections = client.list_collections()
+        if collection_name not in collections:
 
-        # 检查集合是否存在，如果不存在则创建
-        if not utility.has_collection(collection_name):
-            # 定义字段
-            commit_id = FieldSchema(name="commit_id", dtype=DataType.VARCHAR, max_length=100, is_primary=True)
-            repo_path = FieldSchema(name="repo_path", dtype=DataType.VARCHAR, max_length=500)
-            branch = FieldSchema(name="branch", dtype=DataType.VARCHAR, max_length=100)
-            commit_message = FieldSchema(name="commit_message", dtype=DataType.VARCHAR, max_length=500)
-            commit_timestamp = FieldSchema(name="commit_timestamp", dtype=DataType.INT64)
-            embedding = FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=384)  # 使用Ollama的向量维度
+            fields = [
+                FieldSchema(name="commit_id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, description="ID of the commit", max_length= 100),
+                FieldSchema(name="repo_path", dtype=DataType.VARCHAR, description="Path to the git repository", max_length= 500),
+                FieldSchema(name="branch", dtype=DataType.VARCHAR, max_length=100, description="Branch name",),
+                FieldSchema(name="commit_message", dtype=DataType.VARCHAR, max_length=500, description="The commit message",),
+                FieldSchema(name="commit_timestamp", dtype=DataType.INT64, description="Timestamp of the commit",),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, description="Vector embedding of commit message", dim= 384 ),
+            ]
 
-            # 创建集合模式
-            schema = CollectionSchema(
-                fields=[commit_id, repo_path, branch, commit_message, commit_timestamp, embedding],
-                description="Git commit信息向量存储")
-
+            schema = CollectionSchema(fields=fields, enable_dynamic_field=True,)
             # 创建集合
-            collection = Collection(name=collection_name, schema=schema)
+            # schema = {
+            #     "fields": [
+            #         {
+            #             "name": "commit_id",
+            #             "description": "ID of the commit",
+            #             "data_type": "varchar",
+            #             "max_length": 100,
+            #             "is_primary": True,
+            #         },
+            #         {
+            #             "name": "repo_path",
+            #             "description": "Path to the git repository",
+            #             "data_type": "varchar",
+            #             "max_length": 500,
+            #         },
+            #         {
+            #             "name": "branch",
+            #             "description": "Branch name",
+            #             "data_type": "varchar",
+            #             "max_length": 100,
+            #         },
+            #         {
+            #             "name": "commit_message",
+            #             "description": "The commit message",
+            #             "data_type": "varchar",
+            #             "max_length": 500,
+            #         },
+            #         {
+            #             "name": "commit_timestamp",
+            #             "description": "Timestamp of the commit",
+            #             "data_type": "int64",
+            #         },
+            #         {
+            #             "name": "embedding",
+            #             "description": "Vector embedding of commit message",
+            #             "data_type": "float_vector",
+            #             "dim": 384  # 使用Ollama的向量维度
+            #         }
+            #     ],
+            #     "enable_dynamic_field": True
+            # }
 
-            # 创建索引
-            index_params = {
-                "index_type": "IVF_FLAT",
-                "metric_type": "L2",
-                "params": {"nlist": 128}
-            }
-            collection.create_index(field_name="embedding", index_params=index_params)
+            client.create_collection(
+                collection_name=collection_name,
+                schema=schema
+            )
+            index_params = MilvusClient.prepare_index_params()
+            index_params.add_index(
+                field_name="embedding",
+                metric_type="COSINE",
+                index_type="IVF_FLAT",
+                index_name="vector_index",
+                params={"M": 8, "efConstruction": 64}
+            )
+
+            client.create_index(
+                collection_name=collection_name,
+                field_name="embedding",
+                index_params=index_params,
+            )
+
             print(f"创建集合 '{collection_name}' 成功")
         else:
             print(f"集合 '{collection_name}' 已存在")
 
-        return True
+        return client
     except Exception as e:
-        print(f"设置Milvus连接时出错: {e}")
-        return False
+        print(f"设置MilvusLite连接时出错: {e}")
+        return None
 
 
-def get_recent_commits_from_milvus(repo_path, branch, collection_name='git_commits', limit=5):
-    """从Milvus获取特定分支的最近commit信息"""
+def get_recent_commits_from_milvus(client, repo_path, branch, collection_name='git_commits', limit=5):
+    """从MilvusLite获取特定分支的最近commit信息"""
     try:
-        collection = Collection(collection_name)
-        collection.load()
-
         # 查询特定仓库和分支的最近提交
-        expr = f"repo_path == '{repo_path}' and branch == '{branch}'"
-        results = collection.query(
-            expr=expr,
+        res = client.query(
+            collection_name=collection_name,
+            filter=f'repo_path == "{repo_path}" and branch == "{branch}"',
             output_fields=["commit_message", "commit_timestamp"],
             limit=limit
         )
 
-        # 按时间戳排序
-        results.sort(key=lambda x: x["commit_timestamp"], reverse=True)
+        # 按时间戳排序（因为Milvus查询没有自带排序）
+        results = sorted(res, key=lambda x: x["commit_timestamp"], reverse=True)
 
         return [result["commit_message"] for result in results]
     except Exception as e:
-        print(f"从Milvus获取commit信息时出错: {e}")
+        print(f"从MilvusLite获取commit信息时出错: {e}")
         return []
 
 
-def save_commit_to_milvus(repo_path, branch, commit_message, embeddings_model, collection_name='git_commits'):
-    """将commit信息保存到Milvus"""
+def save_commit_to_milvus(client, repo_path, branch, commit_message, embedding, collection_name='git_commits'):
+    """将commit信息保存到MilvusLite"""
     try:
         # 生成唯一ID
         commit_id = hashlib.md5(f"{repo_path}_{branch}_{commit_message}_{time.time()}".encode()).hexdigest()
 
-        # 获取嵌入向量
-        embedding = embeddings_model.embed_query(commit_message)
-
         # 准备要插入的数据
-        data = [
-            [commit_id],  # commit_id
-            [repo_path],  # repo_path
-            [branch],  # branch
-            [commit_message],  # commit_message
-            [int(time.time())],  # commit_timestamp
-            [embedding]  # embedding
-        ]
+        data = {
+            "commit_id": commit_id,
+            "repo_path": repo_path,
+            "branch": branch,
+            "commit_message": commit_message,
+            "commit_timestamp": int(time.time()),
+            "embedding": embedding
+        }
 
-        # 连接到集合并插入数据
-        collection = Collection(collection_name)
-        collection.insert(data)
-        collection.flush()
+        # 插入数据
+        client.insert(
+            collection_name=collection_name,
+            data=[data]
+        )
 
-        print(f"成功将commit信息保存到Milvus")
+        print(f"成功将commit信息保存到MilvusLite")
         return True
     except Exception as e:
-        print(f"保存commit信息到Milvus时出错: {e}")
+        print(f"保存commit信息到MilvusLite时出错: {e}")
         return False
 
 
-def generate_commit_message(diff_output, diff_detail, repo_path, branch, model_name="llama3"):
+def generate_commit_message(diff_output, diff_detail, client, repo_path, branch, model_name="qwen2.5:3b",
+                            collection_name='git_commits'):
     """使用Ollama生成提交信息，并参考之前的commit历史"""
     try:
         # 初始化Ollama
@@ -154,7 +201,7 @@ def generate_commit_message(diff_output, diff_detail, repo_path, branch, model_n
         embeddings_model = OllamaEmbeddings(model=model_name)
 
         # 获取该分支最近的提交历史
-        recent_commits = get_recent_commits_from_milvus(repo_path, branch)
+        recent_commits = get_recent_commits_from_milvus(client, repo_path, branch, collection_name)
         recent_commits_str = "\n".join([f"- {commit}" for commit in recent_commits]) if recent_commits else "无历史提交记录"
 
         # 创建提示模板
@@ -184,7 +231,7 @@ def generate_commit_message(diff_output, diff_detail, repo_path, branch, model_n
         )
 
         # 创建链
-        chain = prompt | llm | StrOutputParser()
+        chain = LLMChain(llm=llm, prompt=prompt)
 
         # 运行链并生成提交信息
         commit_message = chain.run(
@@ -205,16 +252,18 @@ def generate_commit_message(diff_output, diff_detail, repo_path, branch, model_n
         sys.exit(1)
 
 
-def commit_and_push(repo_path, commit_message, embeddings_model, remote="origin", branch="main"):
-    """提交更改并推送到远程仓库，同时保存commit信息到Milvus"""
+def commit_and_push(repo_path, commit_message, client, embeddings_model, remote="origin", branch="main",
+                    collection_name='git_commits'):
+    """提交更改并推送到远程仓库，同时保存commit信息到MilvusLite"""
     os.chdir(repo_path)
     try:
         # 提交更改
         subprocess.run(['git', 'commit', '-m', commit_message], check=True)
         print(f"已成功提交: {commit_message}")
 
-        # 保存commit信息到Milvus
-        save_commit_to_milvus(repo_path, branch, commit_message, embeddings_model)
+        # 获取嵌入向量并保存commit信息到MilvusLite
+        embedding = embeddings_model.embed_query(commit_message)
+        save_commit_to_milvus(client, repo_path, branch, commit_message, embedding, collection_name)
 
         # 检查远程仓库是否存在
         if remote:
@@ -239,7 +288,7 @@ def main():
     parser = argparse.ArgumentParser(description='自动生成Git提交信息并推送到远程仓库')
     parser.add_argument('--repo', type=str, default=os.getcwd(),
                         help='Git仓库的路径 (默认为当前目录)')
-    parser.add_argument('--model', type=str, default='llama3',
+    parser.add_argument('--model', type=str, default='qwen2.5:3b',
                         help='要使用的Ollama模型名称 (默认为llama3)')
     parser.add_argument('--remote', type=str, default='origin',
                         help='远程仓库名称 (默认为origin)')
@@ -247,10 +296,8 @@ def main():
                         help='分支名称 (默认为当前分支)')
     parser.add_argument('--no-push', action='store_true',
                         help='仅提交更改，不推送到远程仓库')
-    parser.add_argument('--milvus-host', type=str, default='localhost',
-                        help='Milvus服务器主机 (默认为localhost)')
-    parser.add_argument('--milvus-port', type=str, default='19530',
-                        help='Milvus服务器端口 (默认为19530)')
+    parser.add_argument('--milvus-uri', type=str, default='milvus.db',
+                        help='MilvusLite URI (默认为当前目录下的milvus.db)')
     parser.add_argument('--collection', type=str, default='git_commits',
                         help='Milvus集合名称 (默认为git_commits)')
 
@@ -259,24 +306,26 @@ def main():
     # 使用指定分支或获取当前分支
     branch = args.branch if args.branch else get_current_branch()
 
-    # 设置Milvus连接
-    if not setup_milvus_connection(args.milvus_host, args.milvus_port, args.collection):
-        print("无法连接到Milvus，将继续执行但不保存commit历史")
+    # 设置MilvusLite连接
+    client = setup_milvus_lite(args.milvus_uri, args.collection)
+    if client is None:
+        print("无法连接到MilvusLite，将退出程序")
+        sys.exit(1)
 
     # 获取Git更改
     diff_output, diff_detail = get_git_changes(args.repo)
 
     # 生成提交信息，同时获取嵌入模型以便后续使用
     commit_message, embeddings_model = generate_commit_message(
-        diff_output, diff_detail, args.repo, branch, args.model
+        diff_output, diff_detail, client, args.repo, branch, args.model, args.collection
     )
     print(f"生成的提交信息: {commit_message}")
 
     # 提交并推送
     if args.no_push:
-        commit_and_push(args.repo, commit_message, embeddings_model, None, branch)
+        commit_and_push(args.repo, commit_message, client, embeddings_model, None, branch, args.collection)
     else:
-        commit_and_push(args.repo, commit_message, embeddings_model, args.remote, branch)
+        commit_and_push(args.repo, commit_message, client, embeddings_model, args.remote, branch, args.collection)
 
 
 if __name__ == "__main__":
