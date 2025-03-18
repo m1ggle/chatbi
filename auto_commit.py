@@ -10,10 +10,10 @@ from langchain.prompts import PromptTemplate
 from langchain_ollama import OllamaEmbeddings
 from langchain_ollama.llms import OllamaLLM
 from pymilvus import MilvusClient, FieldSchema, DataType, CollectionSchema
+from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 
 
 def get_git_changes(repo_path):
-
     """获取Git仓库中的更改内容"""
     os.chdir(repo_path)
     # 检查是否是git仓库
@@ -55,22 +55,24 @@ def setup_milvus_lite(uri='.milvus.db', collection_name='git_commits'):
     try:
         # 连接到MilvusLite
         client = MilvusClient(uri=uri)
-        model = OllamaLLM(model="qwen2.5:3b")
-        embeddings_model = OllamaEmbeddings(model="qwen2.5:3b")
         # 检查集合是否存在
         collections = client.list_collections()
         if collection_name not in collections:
 
             fields = [
-                FieldSchema(name="commit_id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, description="ID of the commit", max_length= 100),
-                FieldSchema(name="repo_path", dtype=DataType.VARCHAR, description="Path to the git repository", max_length= 500),
-                FieldSchema(name="branch", dtype=DataType.VARCHAR, max_length=100, description="Branch name",),
-                FieldSchema(name="commit_message", dtype=DataType.VARCHAR, max_length=500, description="The commit message",),
-                FieldSchema(name="commit_timestamp", dtype=DataType.INT64, description="Timestamp of the commit",),
-                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, description="Vector embedding of commit message", dim= 384 ),
+                FieldSchema(name="commit_id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False,
+                            description="ID of the commit", max_length=100),
+                FieldSchema(name="repo_path", dtype=DataType.VARCHAR, description="Path to the git repository",
+                            max_length=500),
+                FieldSchema(name="branch", dtype=DataType.VARCHAR, max_length=100, description="Branch name", ),
+                FieldSchema(name="commit_message", dtype=DataType.VARCHAR, max_length=500,
+                            description="The commit message", ),
+                FieldSchema(name="commit_timestamp", dtype=DataType.INT64, description="Timestamp of the commit", ),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR,
+                            description="Vector embedding of commit message", dim=384),
             ]
 
-            schema = CollectionSchema(fields=fields, enable_dynamic_field=True,)
+            schema = CollectionSchema(fields=fields, enable_dynamic_field=True, )
             # 创建集合
             # schema = {
             #     "fields": [
@@ -198,7 +200,11 @@ def generate_commit_message(diff_output, diff_detail, client, repo_path, branch,
     try:
         # 初始化Ollama
         llm = OllamaLLM(model=model_name)
-        embeddings_model = OllamaEmbeddings(model=model_name)
+        embeddings_model = BGEM3EmbeddingFunction(
+            model_name='BAAI/bge-m3',  # Specify the model name
+            device='cpu',  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
+            use_fp16=False  # Specify whether to use fp16. Set to `False` if `device` is `cpu`.
+        )
 
         # 获取该分支最近的提交历史
         recent_commits = get_recent_commits_from_milvus(client, repo_path, branch, collection_name)
@@ -285,7 +291,9 @@ def commit_and_push(repo_path, commit_message, client, embeddings_model, remote=
 
 
 def main():
+
     parser = argparse.ArgumentParser(description='自动生成Git提交信息并推送到远程仓库')
+
     parser.add_argument('--repo', type=str, default=os.getcwd(),
                         help='Git仓库的路径 (默认为当前目录)')
     parser.add_argument('--model', type=str, default='qwen2.5:3b',
